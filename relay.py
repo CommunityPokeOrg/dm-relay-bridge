@@ -13,10 +13,11 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 import discord
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 
 load_dotenv()  # config is loaded from a .env file
 
@@ -29,6 +30,10 @@ log = logging.getLogger("dm-relay")
 DISCORD_LIMIT = 2000
 TELEGRAM_LIMIT = 4096
 RECONNECT_DELAY = 5
+# Discord's typing indicator expires after ~10s, so re-trigger on an interval
+# while Telegram keeps sending typing updates (they arrive every ~5s).
+TYPING_INTERVAL = 8
+TYPING_STALE_AFTER = 10
 
 
 def env(name: str) -> str:
@@ -77,6 +82,11 @@ tg = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH)
 
 _dm_channel = None
 
+# Typing-mirroring state.
+_target_peer_id = None      # resolved marked peer id of TG_TARGET
+_last_typing_at = 0.0       # monotonic time of the last target typing update
+_typing_task = None         # task re-triggering the Discord typing indicator
+
 
 async def discord_dm_channel():
     global _dm_channel
@@ -112,12 +122,45 @@ async def on_message(message: discord.Message):
 # --- Telegram -> Discord -----------------------------------------------------
 
 
+async def _mirror_typing():
+    """Keep the Discord DM typing indicator alive while the target types."""
+    try:
+        channel = await discord_dm_channel()
+        while time.monotonic() - _last_typing_at < TYPING_STALE_AFTER:
+            await channel.typing()
+            await asyncio.sleep(TYPING_INTERVAL)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("Failed to mirror typing indicator to Discord")
+
+
+@tg.on(events.UserUpdate)
+async def on_telegram_typing(event):
+    # Only typing actions from the configured target chat matter.
+    if not event.typing or event.chat_id != _target_peer_id:
+        return
+    global _last_typing_at, _typing_task
+    _last_typing_at = time.monotonic()
+    if _typing_task is None or _typing_task.done():
+        _typing_task = asyncio.create_task(_mirror_typing())
+
+
+def _stop_typing():
+    """Stop mirroring once the reply has been relayed."""
+    global _last_typing_at
+    _last_typing_at = 0.0
+    if _typing_task is not None and not _typing_task.done():
+        _typing_task.cancel()
+
+
 @tg.on(events.NewMessage(chats=TG_TARGET))
 async def on_telegram_message(event):
     msg = event.message
     # Ignore our own outgoing messages and non-text content.
     if msg.out or not msg.text:
         return
+    _stop_typing()
     try:
         channel = await discord_dm_channel()
         for chunk in split_text(msg.text, DISCORD_LIMIT):
@@ -134,8 +177,10 @@ async def run():
     await tg.start()  # first run prompts for phone/login code interactively
     me = await tg.get_me()
     log.info("Telegram: logged in as %s (id=%s)", me.username or me.first_name, me.id)
-    await tg.get_entity(TG_TARGET)  # resolve once so a bad target fails fast
-    log.info("Telegram target: %s", TG_TARGET)
+    target = await tg.get_entity(TG_TARGET)  # resolve so a bad target fails fast
+    global _target_peer_id
+    _target_peer_id = utils.get_peer_id(target)
+    log.info("Telegram target: %s (peer id=%s)", TG_TARGET, _target_peer_id)
     await asyncio.gather(
         bot.start(BOT_TOKEN),
         tg.run_until_disconnected(),

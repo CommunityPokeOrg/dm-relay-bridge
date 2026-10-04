@@ -5,6 +5,7 @@ A small two-way DM relay:
 - A **discord.py bot** listens for DMs from **one allowlisted Discord user ID** (and ignores everyone else and all guild messages).
 - A **Telethon user session** (your own Telegram account) forwards each allowed DM to a configurable Telegram chat — e.g. your Poke chat — sent *as your own account*.
 - Incoming replies in that Telegram chat are relayed back into the same Discord DM.
+- When the Telegram target is typing, the bot shows a typing indicator in the Discord DM (mirrored via Telethon `UserUpdate` events; since Discord's indicator expires after ~10s it's re-triggered while Telegram keeps sending typing updates, and stops once the reply is relayed).
 
 Configuration is loaded from a `.env` file (see `.env.example`). Core logic is a single file (`relay.py`, ~180 lines) with long-message splitting and automatic reconnect.
 
@@ -62,6 +63,7 @@ Once running, DM the Discord bot from the allowlisted account — messages appea
 
 - **Access control:** only `USER_ID` can use the relay. All other users' DMs and all guild messages are ignored.
 - Messages **you** send in the Telegram chat (outgoing) are never echoed back to Discord, so there is no loop.
+- Typing mirroring is one-way (Telegram -> Discord) and only reacts to the configured `TG_TARGET` chat; typing updates from anyone else are ignored.
 - Messages longer than the Telegram (4096) or Discord (2000) limits are split automatically. Discord attachments are forwarded as their URLs.
 - **Never commit** `.env`, `*.session`, or `*.session-journal` — they're in `.gitignore`. Anyone holding your session file or `api_hash` can act as your Telegram account; anyone holding the bot token can act as the bot.
 - If a side disconnects, the clients reconnect automatically; a crash restarts the relay after 5 seconds.

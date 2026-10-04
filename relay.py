@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
 import time
 
 import discord
@@ -34,6 +35,10 @@ RECONNECT_DELAY = 5
 # while Telegram keeps sending typing updates (they arrive every ~5s).
 TYPING_INTERVAL = 8
 TYPING_STALE_AFTER = 10
+# Telegram media captions are limited to 1024 characters.
+TG_CAPTION_LIMIT = 1024
+# Fallback upload cap for Discord DMs when the channel does not report one.
+DISCORD_FILE_LIMIT = 10 * 1024 * 1024
 
 
 def env(name: str) -> str:
@@ -105,15 +110,27 @@ async def on_message(message: discord.Message):
     if message.guild is not None or message.author.id != USER_ID:
         return
     text = message.content or ""
-    if message.attachments:
-        urls = "\n".join(a.url for a in message.attachments)
-        text = f"{text}\n{urls}".strip()
-    if not text:
+    if not text and not message.attachments:
         return
     try:
-        for chunk in split_text(text, TELEGRAM_LIMIT):
-            await tg.send_message(TG_TARGET, chunk)
-        log.info("Discord -> Telegram: %d chars", len(text))
+        caption_used = False
+        for attachment in message.attachments:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                name = os.path.basename(attachment.filename) or "file"
+                path = os.path.join(tmpdir, name)
+                await attachment.save(path)
+                # The message text becomes the first file's caption if it fits.
+                caption = None
+                if text and not caption_used and len(text) <= TG_CAPTION_LIMIT:
+                    caption = text
+                    caption_used = True
+                await tg.send_file(TG_TARGET, path, caption=caption)
+                log.info("Discord -> Telegram file: %s", attachment.filename)
+        if text and not caption_used:
+            for chunk in split_text(text, TELEGRAM_LIMIT):
+                await tg.send_message(TG_TARGET, chunk)
+        if text:
+            log.info("Discord -> Telegram: %d chars", len(text))
     except Exception:
         log.exception("Failed to relay DM to Telegram")
         await message.channel.send("[relay] failed to deliver your message to Telegram")
@@ -154,18 +171,55 @@ def _stop_typing():
         _typing_task.cancel()
 
 
+def _discord_file_limit(channel) -> int:
+    return getattr(channel, "filesize_limit", DISCORD_FILE_LIMIT)
+
+
+async def _send_media_to_discord(channel, msg):
+    """Download a Telegram message's media and re-upload it to Discord."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = await msg.download_media(file=tmpdir)
+        if path is None:  # e.g. a webpage preview — nothing to download
+            return
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        limit = _discord_file_limit(channel)
+        if size > limit:
+            await channel.send(
+                f"[relay] Telegram file `{name}` ({size / 1e6:.1f} MB) exceeds "
+                f"Discord's upload limit ({limit / 1e6:.0f} MB); "
+                "open the Telegram chat to view it"
+            )
+            log.info("Skipped oversized Telegram file: %s (%d bytes)", name, size)
+            return
+        discord_file = discord.File(path, filename=name)
+        try:
+            await channel.send(file=discord_file)
+            log.info("Telegram -> Discord file: %s (%d bytes)", name, size)
+        except discord.HTTPException:
+            await channel.send(
+                f"[relay] could not upload Telegram file `{name}` to Discord"
+            )
+            raise
+        finally:
+            discord_file.close()
+
+
 @tg.on(events.NewMessage(chats=TG_TARGET))
 async def on_telegram_message(event):
     msg = event.message
-    # Ignore our own outgoing messages and non-text content.
-    if msg.out or not msg.text:
+    # Ignore our own outgoing messages and empty updates.
+    if msg.out or not (msg.text or msg.media):
         return
     _stop_typing()
     try:
         channel = await discord_dm_channel()
-        for chunk in split_text(msg.text, DISCORD_LIMIT):
-            await channel.send(chunk)
-        log.info("Telegram -> Discord: %d chars", len(msg.text))
+        if msg.text:
+            for chunk in split_text(msg.text, DISCORD_LIMIT):
+                await channel.send(chunk)
+            log.info("Telegram -> Discord: %d chars", len(msg.text))
+        if msg.media:
+            await _send_media_to_discord(channel, msg)
     except Exception:
         log.exception("Failed to relay Telegram message to Discord")
 

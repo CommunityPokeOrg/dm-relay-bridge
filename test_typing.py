@@ -15,30 +15,53 @@ os.environ.setdefault("TG_API_HASH", "test-hash")
 os.environ.setdefault("TG_SESSION", os.path.join(os.path.dirname(__file__), "test_session"))
 os.environ.setdefault("TG_TARGET", "@someone")
 
+import discord  # noqa: E402
 import relay  # noqa: E402
 
 
 class FakeChannel:
-    def __init__(self):
+    def __init__(self, fail_on_file=False, fail_on_text=False, too_large=False):
         self.typing_calls = 0
         self.sent = []
+        self._fail_on_file = fail_on_file
+        self._fail_on_text = fail_on_text
+        self._too_large = too_large
 
     async def typing(self):
         self.typing_calls += 1
 
     async def send(self, text=None, file=None):
         if file is not None:
+            if self._fail_on_file:
+                raise RuntimeError("send failed")
+            if self._too_large:
+                resp = type(
+                    "R", (), {"status": 413, "reason": "Request Entity Too Large"}
+                )()
+                raise discord.HTTPException(
+                    resp, {"code": 40005, "message": "Request entity too large"}
+                )
             self.sent.append(("file", file.filename, os.path.getsize(file.fp.name)))
         else:
+            if self._fail_on_text:
+                raise RuntimeError("send failed")
             self.sent.append(text)
 
 
 class FakeAttachment:
-    def __init__(self, filename="pic.png", data=b"fake-bytes"):
+    def __init__(self, filename="pic.png", data=b"fake-bytes", fail=False):
         self.filename = filename
         self._data = data
+        self._fail = fail
+
+    async def read(self):
+        if self._fail:
+            raise RuntimeError("download failed")
+        return self._data
 
     async def save(self, path):
+        if self._fail:
+            raise RuntimeError("download failed")
         with open(path, "wb") as f:
             f.write(self._data)
 
@@ -72,10 +95,16 @@ class FakeTypingEvent:
 
 
 class FakeMessage:
-    def __init__(self, text="", out=False, media=False, media_size=10):
+    def __init__(self, text="", out=False, media=False, media_size=10,
+                 document_size=None):
         self.text = text
         self.out = out
         self.media = object() if media else None
+        self.document = (
+            type("D", (), {"size": document_size})()
+            if document_size is not None
+            else None
+        )
         self._media_size = media_size
 
     async def download_media(self, file=None):
@@ -86,8 +115,12 @@ class FakeMessage:
 
 
 class FakeMessageEvent:
-    def __init__(self, text="", out=False, media=False, media_size=10):
-        self.message = FakeMessage(text, out, media, media_size)
+    def __init__(self, text="", out=False, media=False, media_size=10,
+                 document_size=None, message=None):
+        if message is not None:
+            self.message = message
+        else:
+            self.message = FakeMessage(text, out, media, media_size, document_size)
 
 
 class TypingMirrorTest(unittest.IsolatedAsyncioTestCase):
@@ -177,6 +210,48 @@ class TypingMirrorTest(unittest.IsolatedAsyncioTestCase):
         await relay.on_telegram_message(event)
         self.assertEqual(relay._dm_channel.sent, [])
 
+    async def test_telegram_media_without_text_relayed(self):
+        # A media-only message (no caption) must still be forwarded.
+        await relay.on_telegram_message(FakeMessageEvent(media=True))
+        self.assertEqual(relay._dm_channel.sent, [("file", "tg_photo.jpg", 10)])
+
+    async def test_telegram_upload_rejected_as_too_large_sends_note(self):
+        relay._dm_channel = FakeChannel(too_large=True)
+        await relay.on_telegram_message(FakeMessageEvent(media=True, media_size=10))
+        sent = relay._dm_channel.sent
+        self.assertEqual(len(sent), 1)
+        self.assertIsInstance(sent[0], str)
+        self.assertIn("exceeds", sent[0])
+
+    async def test_telegram_oversized_document_skipped_before_download(self):
+        class BigDoc(FakeMessage):
+            async def download_media(self, file=None):
+                raise AssertionError("should not download oversized documents")
+        msg = BigDoc(media=True, document_size=relay.DISCORD_FILE_LIMIT + 1)
+        await relay.on_telegram_message(FakeMessageEvent(message=msg))
+        sent = relay._dm_channel.sent
+        self.assertEqual(len(sent), 1)
+        self.assertIsInstance(sent[0], str)
+        self.assertIn("exceeds", sent[0])
+
+    async def test_telegram_text_failure_does_not_block_file(self):
+        relay._dm_channel = FakeChannel(fail_on_text=True)
+        await relay.on_telegram_message(FakeMessageEvent(text="hi", media=True))
+        sent = relay._dm_channel.sent
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "file")
+
+    async def test_telegram_media_failure_surfaces_as_note(self):
+        class BadMedia(FakeMessage):
+            async def download_media(self, file=None):
+                raise RuntimeError("download exploded")
+        await relay.on_telegram_message(
+            FakeMessageEvent(message=BadMedia(media=True))
+        )
+        sent = relay._dm_channel.sent
+        self.assertEqual(len(sent), 1)
+        self.assertIn("could not download", sent[0])
+
 
 class DiscordToTelegramTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -234,6 +309,31 @@ class DiscordToTelegramTest(unittest.IsolatedAsyncioTestCase):
         await relay.on_message(FakeDiscordMessage(text=""))
         self.assertEqual(relay.tg.sent_messages, [])
         self.assertEqual(relay.tg.sent_files, [])
+
+    async def test_failing_attachment_does_not_block_rest(self):
+        msg = FakeDiscordMessage(
+            text="cap",
+            attachments=[
+                FakeAttachment("bad.png", fail=True),
+                FakeAttachment("good.png", b"2"),
+            ],
+        )
+        await relay.on_message(msg)
+        # The good file still goes through and carries the caption since the
+        # first file never made it; the failure is reported to the DM.
+        self.assertEqual(len(relay.tg.sent_files), 1)
+        self.assertEqual(relay.tg.sent_files[0][1], "good.png")
+        self.assertEqual(relay.tg.sent_files[0][3], "cap")
+        self.assertEqual(relay.tg.sent_messages, [])
+        self.assertEqual(len(msg.channel.sent), 1)
+        self.assertIn("failed", msg.channel.sent[0])
+
+    async def test_text_survives_when_file_send_fails(self):
+        msg = FakeDiscordMessage(
+            text="cap", attachments=[FakeAttachment("a.png", fail=True)]
+        )
+        await relay.on_message(msg)
+        self.assertEqual(relay.tg.sent_messages, [("@someone", "cap")])
 
 
 if __name__ == "__main__":

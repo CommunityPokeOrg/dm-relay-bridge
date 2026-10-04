@@ -8,7 +8,7 @@ A small two-way DM relay:
 - Files are relayed in both directions: Discord DM attachments are downloaded and sent via Telethon `send_file` (message text becomes the caption when it fits Telegram's 1024-char caption limit), and media/documents from the Telegram chat are downloaded and re-uploaded as Discord attachments — oversized files produce a `[relay]` note instead.
 - When the Telegram target is typing, the bot shows a typing indicator in the Discord DM (mirrored via Telethon `UserUpdate` events; since Discord's indicator expires after ~10s it's re-triggered while Telegram keeps sending typing updates, and stops once the reply is relayed).
 
-Configuration is loaded from a `.env` file (see `.env.example`). Core logic is a single file (`relay.py`, ~180 lines) with long-message splitting and automatic reconnect.
+Configuration is loaded from a `.env` file (see `.env.example`). Core logic is a single file (`relay.py`, ~300 lines) with long-message splitting and automatic reconnect.
 
 ## Requirements
 

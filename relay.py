@@ -37,8 +37,10 @@ TYPING_INTERVAL = 8
 TYPING_STALE_AFTER = 10
 # Telegram media captions are limited to 1024 characters.
 TG_CAPTION_LIMIT = 1024
-# Fallback upload cap for Discord DMs when the channel does not report one.
-DISCORD_FILE_LIMIT = 10 * 1024 * 1024
+# Upload cap for Discord DMs when the channel does not report one. Discord's
+# standard upload limit is 25 MB; uploads rejected by the API anyway are also
+# handled gracefully.
+DISCORD_FILE_LIMIT = 25 * 1024 * 1024
 
 
 def env(name: str) -> str:
@@ -112,28 +114,46 @@ async def on_message(message: discord.Message):
     text = message.content or ""
     if not text and not message.attachments:
         return
-    try:
-        caption_used = False
-        for attachment in message.attachments:
+    caption_used = False
+    failures = 0
+    for attachment in message.attachments:
+        # The message text becomes the first file's caption if it fits.
+        caption = None
+        if text and not caption_used and len(text) <= TG_CAPTION_LIMIT:
+            caption = text
+        try:
+            data = await attachment.read()
             with tempfile.TemporaryDirectory() as tmpdir:
                 name = os.path.basename(attachment.filename) or "file"
                 path = os.path.join(tmpdir, name)
-                await attachment.save(path)
-                # The message text becomes the first file's caption if it fits.
-                caption = None
-                if text and not caption_used and len(text) <= TG_CAPTION_LIMIT:
-                    caption = text
-                    caption_used = True
+                with open(path, "wb") as f:
+                    f.write(data)
                 await tg.send_file(TG_TARGET, path, caption=caption)
-                log.info("Discord -> Telegram file: %s", attachment.filename)
-        if text and not caption_used:
+        except Exception:
+            log.exception(
+                "Failed to relay attachment %s to Telegram", attachment.filename
+            )
+            failures += 1
+            continue
+        caption_used = caption_used or caption is not None
+        log.info(
+            "Discord -> Telegram file: %s (%d bytes)", attachment.filename, len(data)
+        )
+    if text and not caption_used:
+        try:
             for chunk in split_text(text, TELEGRAM_LIMIT):
                 await tg.send_message(TG_TARGET, chunk)
-        if text:
             log.info("Discord -> Telegram: %d chars", len(text))
-    except Exception:
-        log.exception("Failed to relay DM to Telegram")
-        await message.channel.send("[relay] failed to deliver your message to Telegram")
+        except Exception:
+            log.exception("Failed to relay DM text to Telegram")
+            failures += 1
+    if failures:
+        try:
+            await message.channel.send(
+                f"[relay] failed to deliver {failures} item(s) to Telegram"
+            )
+        except Exception:
+            log.exception("Failed to report relay failure to Discord")
 
 
 # --- Telegram -> Discord -----------------------------------------------------
@@ -175,32 +195,60 @@ def _discord_file_limit(channel) -> int:
     return getattr(channel, "filesize_limit", DISCORD_FILE_LIMIT)
 
 
+def _is_too_large(exc: discord.HTTPException) -> bool:
+    # 413 Request Entity Too Large / Discord error 40005 (upload too large).
+    return getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005
+
+
 async def _send_media_to_discord(channel, msg):
     """Download a Telegram message's media and re-upload it to Discord."""
+    # Skip downloads that are already known to exceed the upload limit
+    # (documents advertise their size; photos do not).
+    limit = _discord_file_limit(channel)
+    size_hint = getattr(getattr(msg, "document", None), "size", None)
+    if size_hint is not None and size_hint > limit:
+        await channel.send(
+            f"[relay] Telegram file ({size_hint / 1e6:.1f} MB) exceeds "
+            f"Discord's upload limit ({limit / 1e6:.0f} MB); "
+            "open the Telegram chat to view it"
+        )
+        log.info("Skipped oversized Telegram document (%d bytes)", size_hint)
+        return
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await msg.download_media(file=tmpdir)
+        try:
+            path = await msg.download_media(file=tmpdir)
+        except Exception:
+            log.exception("Failed to download Telegram media")
+            await channel.send("[relay] could not download a file from Telegram")
+            return
         if path is None:  # e.g. a webpage preview — nothing to download
             return
         name = os.path.basename(path)
         size = os.path.getsize(path)
-        limit = _discord_file_limit(channel)
+        too_large_note = (
+            f"[relay] Telegram file `{name}` ({size / 1e6:.1f} MB) exceeds "
+            f"Discord's upload limit ({limit / 1e6:.0f} MB); "
+            "open the Telegram chat to view it"
+        )
         if size > limit:
-            await channel.send(
-                f"[relay] Telegram file `{name}` ({size / 1e6:.1f} MB) exceeds "
-                f"Discord's upload limit ({limit / 1e6:.0f} MB); "
-                "open the Telegram chat to view it"
-            )
+            await channel.send(too_large_note)
             log.info("Skipped oversized Telegram file: %s (%d bytes)", name, size)
             return
         discord_file = discord.File(path, filename=name)
         try:
             await channel.send(file=discord_file)
             log.info("Telegram -> Discord file: %s (%d bytes)", name, size)
-        except discord.HTTPException:
-            await channel.send(
-                f"[relay] could not upload Telegram file `{name}` to Discord"
-            )
-            raise
+        except discord.HTTPException as e:
+            if _is_too_large(e):
+                await channel.send(too_large_note)
+                log.info(
+                    "Skipped oversized Telegram file: %s (%d bytes)", name, size
+                )
+            else:
+                await channel.send(
+                    f"[relay] could not upload Telegram file `{name}` to Discord"
+                )
+                raise
         finally:
             discord_file.close()
 
@@ -214,14 +262,21 @@ async def on_telegram_message(event):
     _stop_typing()
     try:
         channel = await discord_dm_channel()
-        if msg.text:
+    except Exception:
+        log.exception("Failed to resolve Discord DM channel")
+        return
+    if msg.text:
+        try:
             for chunk in split_text(msg.text, DISCORD_LIMIT):
                 await channel.send(chunk)
             log.info("Telegram -> Discord: %d chars", len(msg.text))
-        if msg.media:
+        except Exception:
+            log.exception("Failed to relay Telegram text to Discord")
+    if msg.media:
+        try:
             await _send_media_to_discord(channel, msg)
-    except Exception:
-        log.exception("Failed to relay Telegram message to Discord")
+        except Exception:
+            log.exception("Failed to relay Telegram media to Discord")
 
 
 # --- Entrypoint --------------------------------------------------------------

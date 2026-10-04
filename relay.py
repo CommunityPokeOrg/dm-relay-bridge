@@ -15,14 +15,10 @@ import os
 import sys
 
 import discord
+from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv()  # config is loaded from a .env file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,11 +56,11 @@ def split_text(text: str, limit: int):
 
 # --- Configuration -----------------------------------------------------------
 
-DISCORD_TOKEN = env("DISCORD_BOT_TOKEN")
+BOT_TOKEN = env("BOT_TOKEN")
 try:
-    ALLOWED_USER_ID = int(env("DISCORD_ALLOWED_USER_ID"))
+    USER_ID = int(env("USER_ID"))
 except ValueError:
-    sys.exit("DISCORD_ALLOWED_USER_ID must be a numeric Discord user ID")
+    sys.exit("USER_ID must be a numeric Discord user ID")
 
 TG_API_ID = int(env("TG_API_ID"))
 TG_API_HASH = env("TG_API_HASH")
@@ -85,7 +81,7 @@ _dm_channel = None
 async def discord_dm_channel():
     global _dm_channel
     if _dm_channel is None:
-        user = await bot.fetch_user(ALLOWED_USER_ID)
+        user = await bot.fetch_user(USER_ID)
         _dm_channel = user.dm_channel or await user.create_dm()
     return _dm_channel
 
@@ -96,7 +92,7 @@ async def discord_dm_channel():
 @bot.event
 async def on_message(message: discord.Message):
     # Only DMs from the single allowlisted user are relayed.
-    if message.guild is not None or message.author.id != ALLOWED_USER_ID:
+    if message.guild is not None or message.author.id != USER_ID:
         return
     text = message.content or ""
     if message.attachments:
@@ -141,7 +137,7 @@ async def run():
     await tg.get_entity(TG_TARGET)  # resolve once so a bad target fails fast
     log.info("Telegram target: %s", TG_TARGET)
     await asyncio.gather(
-        bot.start(DISCORD_TOKEN),
+        bot.start(BOT_TOKEN),
         tg.run_until_disconnected(),
     )
 

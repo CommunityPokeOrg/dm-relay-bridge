@@ -6,7 +6,7 @@ A small two-way DM relay:
 - A **Telethon user session** (your own Telegram account) forwards each allowed DM to a configurable Telegram chat — e.g. your Poke chat — sent *as your own account*.
 - Incoming replies in that Telegram chat are relayed back into the same Discord DM.
 
-Everything is configured via environment variables. Core logic is a single file (`relay.py`, ~180 lines) with long-message splitting and automatic reconnect.
+Configuration is loaded from a `.env` file (see `.env.example`). Core logic is a single file (`relay.py`, ~180 lines) with long-message splitting and automatic reconnect.
 
 ## Requirements
 
@@ -19,10 +19,10 @@ Everything is configured via environment variables. Core logic is a single file 
 ### 1. Discord bot token
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
-2. Open your app → **Bot** → **Reset Token** → copy the token (this is `DISCORD_BOT_TOKEN`).
+2. Open your app → **Bot** → **Reset Token** → copy the token (this is `BOT_TOKEN`).
 3. On the same **Bot** page, enable the **Message Content Intent** (required so the bot can read DM text).
 4. The bot can only DM users it shares a server with: go to **OAuth2 → URL Generator**, select the `bot` scope (no permissions needed), open the URL, and invite it to any guild the allowlisted user is in.
-5. Find the allowlisted user's numeric ID: enable Discord **Settings → Advanced → Developer Mode**, right-click the user → **Copy User ID** (this is `DISCORD_ALLOWED_USER_ID`).
+5. Find the allowlisted user's numeric ID: enable Discord **Settings → Advanced → Developer Mode**, right-click the user → **Copy User ID** (this is `USER_ID`).
 
 ### 2. Telegram api_id / api_hash
 
@@ -39,8 +39,8 @@ Fill in `.env`:
 
 | Variable | Description |
 | --- | --- |
-| `DISCORD_BOT_TOKEN` | Bot token from step 1 |
-| `DISCORD_ALLOWED_USER_ID` | The **only** Discord user ID whose DMs are relayed |
+| `BOT_TOKEN` | Discord bot token from step 1 |
+| `USER_ID` | The **only** Discord user ID whose DMs are relayed |
 | `TG_API_ID` / `TG_API_HASH` | From my.telegram.org |
 | `TG_SESSION` | Path for the Telethon session file, e.g. `./tg_session` |
 | `TG_TARGET` | Telegram chat to relay to: `@username`, phone number, numeric chat ID, or `me` (Saved Messages) |
@@ -60,7 +60,7 @@ Once running, DM the Discord bot from the allowlisted account — messages appea
 
 ## Notes & security
 
-- **Access control:** only `DISCORD_ALLOWED_USER_ID` can use the relay. All other users' DMs and all guild messages are ignored.
+- **Access control:** only `USER_ID` can use the relay. All other users' DMs and all guild messages are ignored.
 - Messages **you** send in the Telegram chat (outgoing) are never echoed back to Discord, so there is no loop.
 - Messages longer than the Telegram (4096) or Discord (2000) limits are split automatically. Discord attachments are forwarded as their URLs.
 - **Never commit** `.env`, `*.session`, or `*.session-journal` — they're in `.gitignore`. Anyone holding your session file or `api_hash` can act as your Telegram account; anyone holding the bot token can act as the bot.

@@ -64,8 +64,8 @@ Once running, DM the Discord bot from the allowlisted account — messages appea
 ## Notes & security
 
 - **Access control:** only `USER_ID` can use the relay. All other users' DMs and all guild messages are ignored.
-- Messages sent into the Telegram chat by the relay itself are never echoed back to Discord, so there is no loop. Messages **you** type in the Telegram app in that chat (or send from another device on your account) are relayed to Discord.
-- Telegram reactions on relayed messages are mirrored as Discord reactions (standard emoji only; custom/paid emoji have no Discord equivalent).
+- Messages **you** send in the Telegram chat (outgoing) are never echoed back to Discord, so there is no loop.
+- Telegram reactions on relayed messages are mirrored as Discord reactions (standard emoji only; custom/paid emoji have no Discord equivalent). Telegram does not reliably push reaction updates for private chats, so reactions are mirrored by polling recently relayed messages every ~10s (plus any pushed `UpdateMessageReactions` updates).
 - Typing mirroring is one-way (Telegram -> Discord) and only reacts to the configured `TG_TARGET` chat; typing updates from anyone else are ignored.
 - Messages longer than the Telegram (4096) or Discord (2000) limits are split automatically. Attachments are relayed as real files via temporary downloads (always cleaned up), not as URLs.
 - **Never commit** `.env`, `*.session`, or `*.session-journal` — they're in `.gitignore`. Anyone holding your session file or `api_hash` can act as your Telegram account; anyone holding the bot token can act as the bot.

@@ -16,7 +16,6 @@ import re
 import sys
 import tempfile
 import time
-from collections import deque
 
 import discord
 from dotenv import load_dotenv
@@ -46,6 +45,10 @@ TG_CAPTION_LIMIT = 1024
 DISCORD_FILE_LIMIT = 25 * 1024 * 1024
 # How many relayed Telegram messages to keep a Discord mapping for (reactions).
 MIRRORED_MSG_CAP = 500
+# Telegram does not reliably push UpdateMessageReactions for private chats
+# (it only fires for others' reactions on your own messages, and only when
+# the message was seen), so reactions are also polled on this interval.
+REACTION_POLL_INTERVAL = 10
 
 # Line-start constructs Discord renders (lists, quotes, headings, subtext),
 # eating or restyling the marker the Telegram user actually typed — e.g.
@@ -114,28 +117,11 @@ _target_peer_id = None      # resolved marked peer id of TG_TARGET
 _last_typing_at = 0.0       # monotonic time of the last target typing update
 _typing_task = None         # task re-triggering the Discord typing indicator
 
-# Ids of messages the relay itself sent to Telegram — used to suppress only
-# the *echo* of relayed Discord DMs instead of every outgoing message
-# (previously msg.out dropped messages the user typed in the Telegram app).
-_relay_sent_ids = deque(maxlen=1000)
-
 # Reaction-mirroring state: Telegram message id -> sent discord.Message
 # objects, and tg id -> the emoji set currently mirrored on Discord.
 _tg_discord_msgs = {}
 _mirrored_reactions = {}
-
-
-def _track_relay_sent(result):
-    """Record message id(s) returned by a Telegram send."""
-    if result is None:
-        return
-    if isinstance(result, (list, tuple)):
-        for msg in result:
-            _track_relay_sent(msg)
-        return
-    msg_id = getattr(result, "id", None)
-    if msg_id is not None:
-        _relay_sent_ids.append(msg_id)
+_reaction_poll_task = None
 
 
 def _remember_discord_msgs(tg_id, messages):
@@ -180,9 +166,7 @@ async def on_message(message: discord.Message):
                 path = os.path.join(tmpdir, name)
                 with open(path, "wb") as f:
                     f.write(data)
-                _track_relay_sent(
-                    await tg.send_file(TG_TARGET, path, caption=caption)
-                )
+                await tg.send_file(TG_TARGET, path, caption=caption)
         except Exception:
             log.exception(
                 "Failed to relay attachment %s to Telegram", attachment.filename
@@ -196,7 +180,7 @@ async def on_message(message: discord.Message):
     if text and not caption_used:
         try:
             for chunk in split_text(text, TELEGRAM_LIMIT):
-                _track_relay_sent(await tg.send_message(TG_TARGET, chunk))
+                await tg.send_message(TG_TARGET, chunk)
             log.info("Discord -> Telegram: %d chars", len(text))
         except Exception:
             log.exception("Failed to relay DM text to Telegram")
@@ -312,12 +296,11 @@ async def _send_media_to_discord(channel, msg):
 @tg.on(events.NewMessage(chats=TG_TARGET))
 async def on_telegram_message(event):
     msg = event.message
-    # Suppress only the echo of messages the relay itself sent to Telegram.
-    # Outgoing messages the user typed in the Telegram app (or sent from
-    # another device on this account) must still reach Discord.
-    if msg.out and msg.id in _relay_sent_ids:
+    # Ignore our own outgoing messages (anything sent as this account,
+    # whether by the relay or by the user in a Telegram app) and empty
+    # updates — otherwise the relay would echo and loop.
+    if msg.out or not (msg.text or msg.media):
         return
-    if not (msg.text or msg.media):
         return
     _stop_typing()
     try:
@@ -346,23 +329,19 @@ async def on_telegram_message(event):
         _remember_discord_msgs(msg.id, discord_msgs)
 
 
-@tg.on(events.Raw(types.UpdateMessageReactions))
-async def on_telegram_reaction(update):
-    """Mirror Telegram reactions on relayed messages as Discord reactions."""
-    if _target_peer_id is None:
-        return
-    if utils.get_peer_id(update.peer) != _target_peer_id:
-        return
-    messages = _tg_discord_msgs.get(update.msg_id)
+async def _apply_reaction_state(tg_id, reactions):
+    """Diff a message's current aggregate reactions against what was mirrored
+    on Discord and add/remove reactions to match."""
+    messages = _tg_discord_msgs.get(tg_id)
     if not messages:
-        return  # reaction on a message the relay did not forward
+        return
     emojis = set()
-    for rc in getattr(update.reactions, "results", None) or ():
+    for rc in getattr(reactions, "results", None) or ():
         # ReactionCustomEmoji/ReactionPaid have no Discord equivalent.
         if isinstance(rc.reaction, types.ReactionEmoji) and rc.reaction.emoticon:
             emojis.add(rc.reaction.emoticon)
     target = messages[-1]
-    old = _mirrored_reactions.get(update.msg_id, set())
+    old = _mirrored_reactions.get(tg_id, set())
     for emoji in emojis - old:
         try:
             await target.add_reaction(emoji)
@@ -374,9 +353,46 @@ async def on_telegram_reaction(update):
         except Exception:
             log.exception("Failed to remove reaction %s on Discord", emoji)
     if emojis:
-        _mirrored_reactions[update.msg_id] = emojis
+        _mirrored_reactions[tg_id] = emojis
     else:
-        _mirrored_reactions.pop(update.msg_id, None)
+        _mirrored_reactions.pop(tg_id, None)
+
+
+@tg.on(events.Raw(types.UpdateMessageReactions))
+async def on_telegram_reaction(update):
+    """Mirror pushed Telegram reactions on relayed messages (when they arrive)."""
+    if _target_peer_id is None:
+        return
+    if utils.get_peer_id(update.peer) != _target_peer_id:
+        return
+    await _apply_reaction_state(update.msg_id, update.reactions)
+
+
+async def _poll_reactions():
+    """Poll reactions on recently relayed messages and mirror any changes.
+
+    Telegram does not reliably push UpdateMessageReactions in private chats:
+    the update only fires for other users' reactions on your own messages
+    (and only once the message was seen). Polling `Message.reactions` on the
+    messages this relay forwarded covers every case push misses, including
+    reactions on the peer's own messages and your own reactions from other
+    devices.
+    """
+    while True:
+        await asyncio.sleep(REACTION_POLL_INTERVAL)
+        ids = [tg_id for tg_id in _tg_discord_msgs if _tg_discord_msgs[tg_id]]
+        if not ids:
+            continue
+        try:
+            msgs = await tg.get_messages(TG_TARGET, ids=ids)
+        except Exception:
+            log.exception("Failed to poll Telegram reactions")
+            continue
+        if not isinstance(msgs, list):
+            msgs = [msgs]
+        for m in msgs:
+            if m is not None and getattr(m, "id", None) in _tg_discord_msgs:
+                await _apply_reaction_state(m.id, m.reactions)
 
 
 # --- Entrypoint --------------------------------------------------------------
@@ -390,6 +406,8 @@ async def run():
     global _target_peer_id
     _target_peer_id = utils.get_peer_id(target)
     log.info("Telegram target: %s (peer id=%s)", TG_TARGET, _target_peer_id)
+    global _reaction_poll_task
+    _reaction_poll_task = asyncio.create_task(_poll_reactions())
     await asyncio.gather(
         bot.start(BOT_TOKEN),
         tg.run_until_disconnected(),

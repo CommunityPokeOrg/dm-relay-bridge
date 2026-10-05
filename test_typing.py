@@ -98,20 +98,20 @@ class FakeTG:
     def __init__(self):
         self.sent_files = []
         self.sent_messages = []
-        self._next_id = 1000
-
-    def _sent(self):
-        self._next_id += 1
-        return type("M", (), {"id": self._next_id})()
+        self.polled = []
 
     async def send_file(self, target, path, caption=None):
         with open(path, "rb") as f:
             self.sent_files.append((target, os.path.basename(path), f.read(), caption))
-        return self._sent()
 
     async def send_message(self, target, text):
         self.sent_messages.append((target, text))
-        return self._sent()
+
+    async def get_messages(self, target, ids=None):
+        self.polled.append((target, ids))
+        return self._poll_result
+
+    _poll_result = []
 
 
 class FakeTypingEvent:
@@ -169,7 +169,6 @@ class TypingMirrorTest(unittest.IsolatedAsyncioTestCase):
         relay._target_peer_id = 777
         relay._last_typing_at = 0.0
         relay._typing_task = None
-        relay._relay_sent_ids.clear()
         relay._tg_discord_msgs.clear()
         relay._mirrored_reactions.clear()
         # Shrink the timings so tests run fast.
@@ -384,7 +383,6 @@ class TelegramToDiscordTest(unittest.IsolatedAsyncioTestCase):
         relay._dm_channel = FakeChannel()
         relay._target_peer_id = 777
         relay._typing_task = None
-        relay._relay_sent_ids.clear()
         relay._tg_discord_msgs.clear()
         relay._mirrored_reactions.clear()
         self._orig_tg = relay.tg
@@ -392,24 +390,18 @@ class TelegramToDiscordTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         relay.tg = self._orig_tg
-        relay._relay_sent_ids.clear()
         relay._tg_discord_msgs.clear()
         relay._mirrored_reactions.clear()
 
-    async def test_relay_echo_suppressed_but_outgoing_relayed(self):
-        # A Discord DM relayed to Telegram must not bounce back to Discord.
-        await relay.on_message(FakeDiscordMessage(text="ping"))
-        relayed_id = relay._relay_sent_ids[-1]
-        await relay.on_telegram_message(
-            FakeMessageEvent(text="ping", out=True, mid=relayed_id)
-        )
+    async def test_outgoing_messages_dropped(self):
+        # Anything sent as the Telegram account — the relay's own forwards
+        # or messages the user typed in a Telegram app — is outgoing and
+        # must never reach Discord (no echo, no loops).
+        for mid, text in [(1, "relay echo"), (2, "typed in tg")]:
+            await relay.on_telegram_message(
+                FakeMessageEvent(text=text, out=True, mid=mid)
+            )
         self.assertEqual(relay._dm_channel.sent, [])
-        # But a message the user typed in the Telegram app is NOT the relay
-        # echo — it must reach Discord even though it is outgoing.
-        await relay.on_telegram_message(
-            FakeMessageEvent(text="typed in tg", out=True, mid=relayed_id + 1)
-        )
-        self.assertEqual(relay._dm_channel.sent, ["typed in tg"])
 
     async def test_leading_markers_escaped(self):
         for raw, want in [
@@ -429,6 +421,23 @@ class TelegramToDiscordTest(unittest.IsolatedAsyncioTestCase):
             relay._dm_channel.sent.clear()
             await relay.on_telegram_message(FakeMessageEvent(text=raw))
             self.assertEqual(relay._dm_channel.sent, [raw], raw)
+
+    async def test_reaction_polled_from_message_state(self):
+        # Polling path: a message's .reactions diff is mirrored the same
+        # way as a pushed UpdateMessageReactions.
+        await relay.on_telegram_message(FakeMessageEvent(text="hi", mid=42))
+        sent = relay._dm_channel.sent_msgs[-1]
+        reactions = types.MessageReactions(
+            results=[
+                types.ReactionCount(
+                    reaction=types.ReactionEmoji(emoticon="👍"), count=1
+                )
+            ]
+        )
+        await relay._apply_reaction_state(42, reactions)
+        self.assertEqual(sent.added_reactions, ["👍"])
+        await relay._apply_reaction_state(42, None)
+        self.assertEqual(sent.removed_reactions, [("👍", relay.bot.user)])
 
     async def test_reaction_mirrored_to_discord(self):
         await relay.on_telegram_message(

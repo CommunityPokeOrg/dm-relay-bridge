@@ -16,13 +16,29 @@ os.environ.setdefault("TG_SESSION", os.path.join(os.path.dirname(__file__), "tes
 os.environ.setdefault("TG_TARGET", "@someone")
 
 import discord  # noqa: E402
+from telethon.tl import types  # noqa: E402
 import relay  # noqa: E402
+
+
+class FakeSent:
+    """Stand-in for the discord.Message returned by channel.send()."""
+
+    def __init__(self):
+        self.added_reactions = []
+        self.removed_reactions = []
+
+    async def add_reaction(self, emoji):
+        self.added_reactions.append(emoji)
+
+    async def remove_reaction(self, emoji, member):
+        self.removed_reactions.append((emoji, member))
 
 
 class FakeChannel:
     def __init__(self, fail_on_file=False, fail_on_text=False, too_large=False):
         self.typing_calls = 0
         self.sent = []
+        self.sent_msgs = []
         self._fail_on_file = fail_on_file
         self._fail_on_text = fail_on_text
         self._too_large = too_large
@@ -46,6 +62,9 @@ class FakeChannel:
             if self._fail_on_text:
                 raise RuntimeError("send failed")
             self.sent.append(text)
+        msg = FakeSent()
+        self.sent_msgs.append(msg)
+        return msg
 
 
 class FakeAttachment:
@@ -79,6 +98,7 @@ class FakeTG:
     def __init__(self):
         self.sent_files = []
         self.sent_messages = []
+        self.polled = []
 
     async def send_file(self, target, path, caption=None):
         with open(path, "rb") as f:
@@ -86,6 +106,12 @@ class FakeTG:
 
     async def send_message(self, target, text):
         self.sent_messages.append((target, text))
+
+    async def get_messages(self, target, ids=None):
+        self.polled.append((target, ids))
+        return self._poll_result
+
+    _poll_result = []
 
 
 class FakeTypingEvent:
@@ -96,7 +122,8 @@ class FakeTypingEvent:
 
 class FakeMessage:
     def __init__(self, text="", out=False, media=False, media_size=10,
-                 document_size=None):
+                 document_size=None, mid=None):
+        self.id = mid
         self.text = text
         self.out = out
         self.media = object() if media else None
@@ -116,11 +143,24 @@ class FakeMessage:
 
 class FakeMessageEvent:
     def __init__(self, text="", out=False, media=False, media_size=10,
-                 document_size=None, message=None):
+                 document_size=None, message=None, mid=None):
         if message is not None:
             self.message = message
         else:
-            self.message = FakeMessage(text, out, media, media_size, document_size)
+            self.message = FakeMessage(
+                text, out, media, media_size, document_size, mid
+            )
+
+
+class FakeReactionUpdate:
+    def __init__(self, peer_id, msg_id, reactions):
+        self.peer = types.PeerUser(peer_id)
+        self.msg_id = msg_id
+        self.reactions = types.MessageReactions(
+            results=[
+                types.ReactionCount(reaction=r, count=1) for r in reactions
+            ]
+        )
 
 
 class TypingMirrorTest(unittest.IsolatedAsyncioTestCase):
@@ -129,6 +169,8 @@ class TypingMirrorTest(unittest.IsolatedAsyncioTestCase):
         relay._target_peer_id = 777
         relay._last_typing_at = 0.0
         relay._typing_task = None
+        relay._tg_discord_msgs.clear()
+        relay._mirrored_reactions.clear()
         # Shrink the timings so tests run fast.
         relay.TYPING_INTERVAL = 0.05
         relay.TYPING_STALE_AFTER = 0.15
@@ -334,6 +376,102 @@ class DiscordToTelegramTest(unittest.IsolatedAsyncioTestCase):
         )
         await relay.on_message(msg)
         self.assertEqual(relay.tg.sent_messages, [("@someone", "cap")])
+
+
+class TelegramToDiscordTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        relay._dm_channel = FakeChannel()
+        relay._target_peer_id = 777
+        relay._typing_task = None
+        relay._tg_discord_msgs.clear()
+        relay._mirrored_reactions.clear()
+        self._orig_tg = relay.tg
+        relay.tg = FakeTG()
+
+    async def asyncTearDown(self):
+        relay.tg = self._orig_tg
+        relay._tg_discord_msgs.clear()
+        relay._mirrored_reactions.clear()
+
+    async def test_outgoing_messages_dropped(self):
+        # Anything sent as the Telegram account — the relay's own forwards
+        # or messages the user typed in a Telegram app — is outgoing and
+        # must never reach Discord (no echo, no loops).
+        for mid, text in [(1, "relay echo"), (2, "typed in tg")]:
+            await relay.on_telegram_message(
+                FakeMessageEvent(text=text, out=True, mid=mid)
+            )
+        self.assertEqual(relay._dm_channel.sent, [])
+
+    async def test_leading_markers_escaped(self):
+        for raw, want in [
+            ("- item", "\\- item"),
+            ("* item", "\\* item"),
+            ("1. item", "1\\. item"),
+            ("> quote", "\\> quote"),
+            ("# head", "\\# head"),
+            ("- item\n- two\n1. three", "\\- item\n\\- two\n1\\. three"),
+        ]:
+            relay._dm_channel.sent.clear()
+            await relay.on_telegram_message(FakeMessageEvent(text=raw))
+            self.assertEqual(relay._dm_channel.sent, [want], raw)
+
+    async def test_bold_and_midline_markers_untouched(self):
+        for raw in ["**bold** text", "a - b", "10.5 not a list"]:
+            relay._dm_channel.sent.clear()
+            await relay.on_telegram_message(FakeMessageEvent(text=raw))
+            self.assertEqual(relay._dm_channel.sent, [raw], raw)
+
+    async def test_reaction_polled_from_message_state(self):
+        # Polling path: a message's .reactions diff is mirrored the same
+        # way as a pushed UpdateMessageReactions.
+        await relay.on_telegram_message(FakeMessageEvent(text="hi", mid=42))
+        sent = relay._dm_channel.sent_msgs[-1]
+        reactions = types.MessageReactions(
+            results=[
+                types.ReactionCount(
+                    reaction=types.ReactionEmoji(emoticon="👍"), count=1
+                )
+            ]
+        )
+        await relay._apply_reaction_state(42, reactions)
+        self.assertEqual(sent.added_reactions, ["👍"])
+        await relay._apply_reaction_state(42, None)
+        self.assertEqual(sent.removed_reactions, [("👍", relay.bot.user)])
+
+    async def test_reaction_mirrored_to_discord(self):
+        await relay.on_telegram_message(
+            FakeMessageEvent(text="hi", mid=42)
+        )
+        sent = relay._dm_channel.sent_msgs[-1]
+        update = FakeReactionUpdate(777, 42, [types.ReactionEmoji(emoticon="❤️")])
+        await relay.on_telegram_reaction(update)
+        self.assertEqual(sent.added_reactions, ["❤️"])
+        # Reactions cleared -> remove on Discord.
+        await relay.on_telegram_reaction(FakeReactionUpdate(777, 42, []))
+        self.assertEqual(sent.removed_reactions, [("❤️", relay.bot.user)])
+
+    async def test_reaction_ignored_for_other_chat_or_unknown_msg(self):
+        await relay.on_telegram_message(FakeMessageEvent(text="hi", mid=42))
+        sent = relay._dm_channel.sent_msgs[-1]
+        await relay.on_telegram_reaction(
+            FakeReactionUpdate(999, 42, [types.ReactionEmoji(emoticon="❤️")])
+        )
+        await relay.on_telegram_reaction(
+            FakeReactionUpdate(777, 999, [types.ReactionEmoji(emoticon="❤️")])
+        )
+        self.assertEqual(sent.added_reactions, [])
+        self.assertEqual(sent.removed_reactions, [])
+
+    async def test_custom_emoji_reaction_skipped(self):
+        await relay.on_telegram_message(FakeMessageEvent(text="hi", mid=42))
+        sent = relay._dm_channel.sent_msgs[-1]
+        await relay.on_telegram_reaction(
+            FakeReactionUpdate(
+                777, 42, [types.ReactionCustomEmoji(document_id=1)]
+            )
+        )
+        self.assertEqual(sent.added_reactions, [])
 
 
 if __name__ == "__main__":

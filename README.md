@@ -7,6 +7,7 @@ A small two-way DM relay:
 - Incoming replies in that Telegram chat are relayed back into the same Discord DM.
 - Files are relayed in both directions: Discord DM attachments are downloaded and sent via Telethon `send_file` (message text becomes the caption when it fits Telegram's 1024-char caption limit), and media/documents from the Telegram chat are downloaded and re-uploaded as Discord attachments — oversized files produce a `[relay]` note instead.
 - When the Telegram target is typing, the bot shows a typing indicator in the Discord DM (mirrored via Telethon `UserUpdate` events; since Discord's indicator expires after ~10s it's re-triggered while Telegram keeps sending typing updates, and stops once the reply is relayed).
+- Telegram text starting with markdown constructs Discord renders (`- `/`* ` bullets, `1. ` ordered lists, `> ` quotes, `#` headings) is escaped before sending to Discord so it arrives verbatim instead of being reformatted.
 
 Configuration is loaded from a `.env` file (see `.env.example`). Core logic is a single file (`relay.py`, ~300 lines) with long-message splitting and automatic reconnect.
 
@@ -63,7 +64,8 @@ Once running, DM the Discord bot from the allowlisted account — messages appea
 ## Notes & security
 
 - **Access control:** only `USER_ID` can use the relay. All other users' DMs and all guild messages are ignored.
-- Messages **you** send in the Telegram chat (outgoing) are never echoed back to Discord, so there is no loop.
+- Messages sent into the Telegram chat by the relay itself are never echoed back to Discord, so there is no loop. Messages **you** type in the Telegram app in that chat (or send from another device on your account) are relayed to Discord.
+- Telegram reactions on relayed messages are mirrored as Discord reactions (standard emoji only; custom/paid emoji have no Discord equivalent).
 - Typing mirroring is one-way (Telegram -> Discord) and only reacts to the configured `TG_TARGET` chat; typing updates from anyone else are ignored.
 - Messages longer than the Telegram (4096) or Discord (2000) limits are split automatically. Attachments are relayed as real files via temporary downloads (always cleaned up), not as URLs.
 - **Never commit** `.env`, `*.session`, or `*.session-journal` — they're in `.gitignore`. Anyone holding your session file or `api_hash` can act as your Telegram account; anyone holding the bot token can act as the bot.
